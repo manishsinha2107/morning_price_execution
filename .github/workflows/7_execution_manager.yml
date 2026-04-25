@@ -5,8 +5,11 @@ on:
   workflow_dispatch:
   
   # Opens a secure webhook listener for cron-job.org
-  # Trigger via POST to: https://api.github.com/repos/YOUR_USERNAME/YOUR_REPO/dispatches
-  # with JSON body: {"event_type": "market_open_execution"}
+  # Trigger via POST to: https://api.github.com/repos/manishsinha2107/morning_price_execution/dispatches
+  # Headers Required:
+  #   Accept: application/vnd.github.v3+json
+  #   Authorization: Bearer YOUR_GITHUB_PERSONAL_ACCESS_TOKEN
+  # Body (JSON): {"event_type": "market_open_execution"}
   repository_dispatch:
     types: [market_open_execution]
 
