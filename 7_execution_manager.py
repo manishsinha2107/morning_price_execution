@@ -1,3 +1,5 @@
+# 7_execution_manager.py
+
 import os
 import pyotp
 import base64
@@ -225,14 +227,19 @@ def run_dual_execution_manager():
             # Scenario 2: Calculate new buffered R/R
             new_rr = new_reward_per_share / new_risk_per_share
             
-            # Extract the exact Bouncer limit (req_rr) used when the trade was approved
+            # --- STRICT TQS AUDIT CHECK (NO FALLBACKS) ---
             try:
                 tqs_data = trade.get('tqs_audit', {})
                 if isinstance(tqs_data, str):
                     tqs_data = json.loads(tqs_data)
-                required_rr = float(tqs_data.get('circuit_breakers', {}).get('req_rr', dials.get(t_type, 1.0)))
-            except Exception:
-                required_rr = dials.get(t_type, 1.0) # Safe fallback to global floor
+                
+                # Fetch the exact RR floor used during the AI's discovery scan
+                required_rr = float(tqs_data['circuit_breakers']['req_rr'])
+            except (KeyError, TypeError, json.JSONDecodeError):
+                print(f"   ❌ {prefix} {sym} ({t_type}): CANCELLED. Critical Error: Missing or Corrupt TQS Audit data. Cannot verify R/R floor.")
+                payload = {"status": "CANCELLED", "exit_reason": "MISSING_TQS_AUDIT"}
+                requests.patch(f"{URL}/rest/v1/{source}?id=eq.{trade_id}", headers=HEADERS, json=payload)
+                continue
 
             buffered_rr_limit = required_rr * (1 - (SLIPPAGE_TOLERANCE_PCT / 100.0))
 
