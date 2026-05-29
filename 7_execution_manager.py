@@ -161,21 +161,79 @@ def run_dual_execution_manager():
     fyers_query_string = ",".join(symbol_map.keys())
     
     print(f"📡 API Strike: Fetching live open prices for {len(symbol_map)} unique assets...")
-    try:
-        quote_res = fyers.quotes({"symbols": fyers_query_string})
-    except Exception as e:
-        print(f"❌ Critical: Fyers Quotes API failed: {e}")
-        exit(1)
+    
+    live_data = []
+    now = datetime.now()
+    is_post_market = (now.hour > 15) or (now.hour == 15 and now.minute >= 30)
 
-    if quote_res.get("s") != "ok":
-        print(f"❌ Broker Error: {quote_res.get('message')}")
-        exit(1)
+    if not is_post_market:
+        # --- BRANCH A: LIVE MARKET (High-Speed Quotes) ---
+        try:
+            quote_res = fyers.quotes({"symbols": fyers_query_string})
+            if quote_res.get("s") == "ok":
+                live_data = quote_res.get("d", [])
+            else:
+                print(f"❌ Broker Error: {quote_res.get('message')}")
+                exit(1)
+        except Exception as e:
+            print(f"❌ Critical: Fyers Quotes API failed: {e}")
+            exit(1)
+    else:
+        # --- BRANCH B: POST-MARKET (Historical OHLC Extraction) ---
+        print("   🌙 Post-Market detected. Switching to Historical OHLC Data Extraction...")
+        from_date = now.strftime('%Y-%m-%d')
+        to_date = now.strftime('%Y-%m-%d')
+        
+        for fyers_sym in symbol_map.keys():
+            try:
+                hist_payload = {
+                    "symbol": fyers_sym,
+                    "resolution": "1D",
+                    "date_format": "1",
+                    "range_from": from_date,
+                    "range_to": to_date,
+                    "cont_flag": "1"
+                }
+                hist_res = fyers.history(hist_payload)
+                
+                if hist_res.get("s") == "ok" and hist_res.get("candles"):
+                    # candles format: [ [epoch, open, high, low, close, volume] ]
+                    latest_candle = hist_res["candles"][0]
+                    
+                    # Reconstruct the exact JSON shape Branch A expects
+                    mocked_quote = {
+                        'n': fyers_sym,
+                        's': 'ok',
+                        'v': {
+                            'open_price': float(latest_candle[1]),
+                            'tt': int(latest_candle[0])
+                        }
+                    }
+                    live_data.append(mocked_quote)
+                else:
+                    live_data.append({
+                        'n': fyers_sym,
+                        's': 'error',
+                        'v': {'errmsg': 'No historical data found for today.'}
+                    })
+            except Exception as e:
+                live_data.append({
+                    'n': fyers_sym,
+                    's': 'error',
+                    'v': {'errmsg': f'History API Exception: {str(e)}'}
+                })
 
     # 4. The Parallel Routing & Recalculation Engine
-    live_data = quote_res.get("d", [])
-    
     for item in live_data:
         fyers_sym = item['n']
+        
+        # --- HEALTH GATEKEEPER: Prevent KeyError Crashes ---
+        if item.get('s') != 'ok':
+            error_msg = item.get('v', {}).get('errmsg', 'Unknown Broker Rejection')
+            print(f"   ⚠️ Skipping {fyers_sym}: {error_msg}")
+            continue
+        # ---------------------------------------------------
+        
         live_open = float(item['v']['open_price'])
         
         # --- THE INTUITIVE HOLIDAY BLOCKER ---
