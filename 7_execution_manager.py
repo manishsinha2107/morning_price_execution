@@ -6,7 +6,7 @@ import base64
 import requests
 import math
 import json
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from fyers_apiv3 import fyersModel
 
@@ -87,7 +87,6 @@ def get_fyers_access_token():
 
 def fetch_system_dials() -> dict:
     try:
-        # We now fetch the global safety floor, not the perfect measuring stick
         r = requests.get(f"{URL}/rest/v1/system_dials?select=trade_type,global_floor_rr", headers=HEADERS)
         if r.status_code == 200:
             return {row['trade_type']: float(row['global_floor_rr']) for row in r.json()}
@@ -96,10 +95,10 @@ def fetch_system_dials() -> dict:
         return {}
 
 # ============================================================
-# 2. CORE DUAL-EXECUTION MANAGER
+# 2. CORE EXECUTION MANAGER (SNIPER ARCHITECTURE)
 # ============================================================
 
-def run_dual_execution_manager():
+def run_execution_manager():
     print(f"⚡ [{datetime.now().strftime('%H:%M:%S')}] Waking up Master Execution Node...")
 
     # ============================================================
@@ -111,7 +110,7 @@ def run_dual_execution_manager():
         print("❌ Critical: Could not authenticate with Fyers broker. Aborting execution.")
         exit(1)
 
-    # --- NEW: SECURE TOKEN DEPOSIT ---
+    # --- SECURE TOKEN DEPOSIT ---
     try:
         requests.patch(
             f"{URL}/rest/v1/broker_sessions?id=eq.1", 
@@ -123,28 +122,21 @@ def run_dual_execution_manager():
         print(f"   ⚠️ Vault deposit failed. UI will remain static today: {e}")
     # ============================================================
 
-    # 1. The Dual-Queue Fetch
+    # 1. The Sniper Queue Fetch
     try:
-        print("📡 Fetching PENDING setups from Daily & Sniper Ledgers...")
-        daily_req = requests.get(f"{URL}/rest/v1/trade_signals?status=eq.AWAITING%20EXECUTION&select=*", headers=HEADERS)
-        daily_trades = daily_req.json() if daily_req.status_code == 200 else []
-        
+        print("📡 Fetching PENDING setups from Sniper Ledger...")
         sniper_req = requests.get(f"{URL}/rest/v1/sniper_trade_signals?status=eq.AWAITING%20EXECUTION&select=*", headers=HEADERS)
         sniper_trades = sniper_req.json() if sniper_req.status_code == 200 else []
     except Exception as e:
         print(f"❌ Critical: Could not fetch pending trades: {e}")
         return
 
-    if not daily_trades and not sniper_trades:
-        print("ℹ️ No PENDING trades found in any queue. Sleeping.")
+    if not sniper_trades:
+        print("ℹ️ No PENDING trades found in queue. Sleeping.")
         return
 
-    # Tag trades with their origin table so the engine knows where to send the update
-    for t in daily_trades: t['source_table'] = 'trade_signals'
-    for t in sniper_trades: t['source_table'] = 'sniper_trade_signals'
-    
-    all_pending = daily_trades + sniper_trades
-    print(f"🔍 Consolidated {len(daily_trades)} Daily and {len(sniper_trades)} Sniper targets.")
+    all_pending = sniper_trades
+    print(f"🔍 Found {len(sniper_trades)} Sniper targets awaiting execution.")
 
     # 2. Fetch Live Dials & Initialize Fyers Model
     dials = fetch_system_dials()
@@ -163,7 +155,6 @@ def run_dual_execution_manager():
     print(f"📡 API Strike: Fetching live open prices for {len(symbol_map)} unique assets...")
     
     # --- SERVER TIMEZONE FIX: Force IST (UTC + 5:30) ---
-    from datetime import timezone, timedelta
     ist_offset = timezone(timedelta(hours=5, minutes=30))
     now = datetime.now(ist_offset)
     # ---------------------------------------------------
@@ -228,7 +219,7 @@ def run_dual_execution_manager():
                     'v': {'errmsg': f'History API Exception: {str(e)}'}
                 })
 
-    # 4. The Parallel Routing & Recalculation Engine
+    # 4. The Routing & Recalculation Engine
     for item in live_data:
         fyers_sym = item['n']
         
@@ -243,16 +234,14 @@ def run_dual_execution_manager():
         live_open = float(v_data['open_price'])
         
         # --- THE INTUITIVE HOLIDAY BLOCKER ---
-        # Extract the Last Traded Time (tt) Unix epoch and convert to date
         last_traded_epoch = int(item['v'].get('tt', 0))
         if last_traded_epoch > 0:
             last_traded_date = datetime.fromtimestamp(last_traded_epoch).date()
             today_date = datetime.now().date()
             
-            # If the quote is from yesterday (or older), the market is closed today.
             if last_traded_date < today_date:
                 print(f"   ⏸️ {fyers_sym} is returning stale data from {last_traded_date.strftime('%d-%b-%Y')}. Market is closed today.")
-                continue # Skip execution, leave it PENDING
+                continue 
         # -------------------------------------
         
         trades_list = symbol_map.get(fyers_sym)
@@ -262,21 +251,15 @@ def run_dual_execution_manager():
             sym = trade['symbol']
             t_type = trade['trade_type']
             trade_id = trade['id']
-            source = trade['source_table']
-            prefix = "[SNIPER]" if source == 'sniper_trade_signals' else "[DAILY]"
+            prefix = "[SNIPER]"
             
-            # Technical levels (Option A: Rigid Target and SL)
             stop_loss = float(trade['stop_loss'])
             target_price = float(trade['target_price'])
             planned_entry = float(trade['entry_price'])
             
-            # --- NEW: DIFFERENTIATED EXECUTION PRICE ---
-            if source == 'sniper_trade_signals':
-                # Sniper defends its discount. Use the Limit Price (unless live open is even cheaper)
-                exec_price = min(live_open, planned_entry)
-            else:
-                # Daily strategy enters at the live open price
-                exec_price = live_open
+            # --- SNIPER EXECUTION PRICE LOGIC ---
+            # Universally defend the discount. Use the Limit Price unless live open is even cheaper.
+            exec_price = min(live_open, planned_entry)
             
             new_risk_per_share = exec_price - stop_loss
             new_reward_per_share = target_price - exec_price
@@ -285,7 +268,7 @@ def run_dual_execution_manager():
             if new_risk_per_share <= 0:
                 print(f"   ❌ {prefix} {sym} ({t_type}): CANCELLED. Gap down instantly violated stop loss level.")
                 payload = {"status": "CANCELLED", "exit_reason": "GAP_CRUSHED_STOP"}
-                requests.patch(f"{URL}/rest/v1/{source}?id=eq.{trade_id}", headers=HEADERS, json=payload)
+                requests.patch(f"{URL}/rest/v1/sniper_trade_signals?id=eq.{trade_id}", headers=HEADERS, json=payload)
                 continue
 
             # Scenario 2: Calculate new buffered R/R
@@ -297,12 +280,11 @@ def run_dual_execution_manager():
                 if isinstance(tqs_data, str):
                     tqs_data = json.loads(tqs_data)
                 
-                # Fetch the exact RR floor used during the AI's discovery scan
                 required_rr = float(tqs_data['circuit_breakers']['req_rr'])
             except (KeyError, TypeError, json.JSONDecodeError):
                 print(f"   ❌ {prefix} {sym} ({t_type}): CANCELLED. Critical Error: Missing or Corrupt TQS Audit data. Cannot verify R/R floor.")
                 payload = {"status": "CANCELLED", "exit_reason": "MISSING_TQS_AUDIT"}
-                requests.patch(f"{URL}/rest/v1/{source}?id=eq.{trade_id}", headers=HEADERS, json=payload)
+                requests.patch(f"{URL}/rest/v1/sniper_trade_signals?id=eq.{trade_id}", headers=HEADERS, json=payload)
                 continue
 
             buffered_rr_limit = required_rr * (1 - (SLIPPAGE_TOLERANCE_PCT / 100.0))
@@ -310,14 +292,13 @@ def run_dual_execution_manager():
             if new_rr < buffered_rr_limit:
                 print(f"   ❌ {prefix} {sym} ({t_type}): CANCELLED. Live R/R ({new_rr:.2f}) < Minimum ({buffered_rr_limit:.2f}).")
                 payload = {"status": "CANCELLED", "exit_reason": "GAP_CRUSHED_RR"}
-                requests.patch(f"{URL}/rest/v1/{source}?id=eq.{trade_id}", headers=HEADERS, json=payload)
+                requests.patch(f"{URL}/rest/v1/sniper_trade_signals?id=eq.{trade_id}", headers=HEADERS, json=payload)
                 continue
 
             # Scenario 3: Passed. Recalculate strict capital limits based on new entry.
             max_cap = MAX_CAPITAL_PER_TRADE.get(t_type, 0)
             max_risk_amount = max_cap * (MAX_RISK_PCT_PER_TRADE.get(t_type, 0) / 100.0)
             
-            # Use exec_price instead of live_open
             capital_shares = math.floor(max_cap / exec_price)
             risk_shares = math.floor(max_risk_amount / new_risk_per_share)
             final_quantity = min(capital_shares, risk_shares)
@@ -325,13 +306,12 @@ def run_dual_execution_manager():
             if final_quantity <= 0:
                 print(f"   ❌ {prefix} {sym} ({t_type}): CANCELLED. Gap altered risk to prevent minimum 1 lot size.")
                 payload = {"status": "CANCELLED", "exit_reason": "GAP_CRUSHED_CAPITAL"}
-                requests.patch(f"{URL}/rest/v1/{source}?id=eq.{trade_id}", headers=HEADERS, json=payload)
+                requests.patch(f"{URL}/rest/v1/sniper_trade_signals?id=eq.{trade_id}", headers=HEADERS, json=payload)
                 continue
 
-            # 5. The Execution Push (Routed to the correct database table)
+            # 5. The Execution Push (Hardcoded to sniper_trade_signals Ledger)
             try:
-                # Strictly format the date as YYYY-MM-DD for Supabase DATE columns
-                exec_date_str = datetime.now().strftime('%Y-%m-%d')
+                exec_date_str = datetime.now(ist_offset).strftime('%Y-%m-%d')
                 
                 payload = {
                     "entry_price": round(exec_price, 2), 
@@ -340,8 +320,7 @@ def run_dual_execution_manager():
                     "execution_date": exec_date_str
                 }
                 
-                # Capture the response to verify actual database success
-                res = requests.patch(f"{URL}/rest/v1/{source}?id=eq.{trade_id}", headers=HEADERS, json=payload)
+                res = requests.patch(f"{URL}/rest/v1/sniper_trade_signals?id=eq.{trade_id}", headers=HEADERS, json=payload)
                 
                 if res.status_code in [200, 204]:
                     print(f"   ✅ {prefix} {sym} ({t_type}) EXECUTED: Status -> ACTIVE | Entry: ₹{exec_price:.2f} | Exec Date: {exec_date_str}")
@@ -349,15 +328,15 @@ def run_dual_execution_manager():
                     print(f"   ⚠️ DB Reject for {sym}: [{res.status_code}] {res.text}")
             
             except Exception as e:
-                print(f"   ⚠️ Network Update failed for {sym} ({t_type}) in {source}: {e}")
+                print(f"   ⚠️ Network Update failed for {sym} ({t_type}): {e}")
 
     print("\n" + "="*80)
-    print(f"{'DUAL EXECUTION MANAGER RUN COMPLETED':^80}")
+    print(f"{'EXECUTION MANAGER RUN COMPLETED':^80}")
     print("="*80)
 
 if __name__ == "__main__":
     try:
-        run_dual_execution_manager()
+        run_execution_manager()
     except Exception as e:
         import traceback
         traceback.print_exc()
