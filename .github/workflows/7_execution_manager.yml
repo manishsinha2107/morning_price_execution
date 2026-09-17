@@ -37,6 +37,8 @@ jobs:
           # Securely inject secrets into the runtime environment
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_MAINSITE_URL: ${{ secrets.SUPABASE_MAINSITE_URL }}
+          SUPABASE_MAINSITE_KEY: ${{ secrets.SUPABASE_MAINSITE_KEY }}
           FYERS_USERNAME: ${{ secrets.FYERS_USERNAME }}
           FYERS_APP_ID: ${{ secrets.FYERS_APP_ID }}
           FYERS_SECRET_ID: ${{ secrets.FYERS_SECRET_ID }}
