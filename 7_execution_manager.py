@@ -1,5 +1,4 @@
 # 7_execution_manager.py
-
 import os
 import pyotp
 import base64
