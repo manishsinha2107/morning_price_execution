@@ -19,11 +19,18 @@ load_dotenv()
 # 1. INITIALISATION & AUTHENTICATION
 # ============================================================
 
-URL = os.environ.get("SUPABASE_URL").rstrip('/')
-KEY = os.environ.get("SUPABASE_KEY")
+# ============================================================
+# 1. INITIALISATION & AUTHENTICATION
+# ============================================================
+
+URL = os.getenv("SUPABASE_URL", "").rstrip('/')
+KEY = os.getenv("SUPABASE_KEY")
+
+MAINSITE_URL = os.getenv("SUPABASE_MAINSITE_URL", "").rstrip('/')
+MAINSITE_KEY = os.getenv("SUPABASE_MAINSITE_KEY")
 
 if not URL or not KEY:
-    print("❌ Error: Supabase credentials missing.")
+    print("❌ Error: Primary Supabase credentials missing.")
     exit(1)
 
 HEADERS = {
@@ -31,6 +38,12 @@ HEADERS = {
     "Authorization": f"Bearer {KEY}",
     "Content-Type": "application/json"
 }
+
+MAINSITE_HEADERS = {
+    "apikey": MAINSITE_KEY,
+    "Authorization": f"Bearer {MAINSITE_KEY}",
+    "Content-Type": "application/json"
+} if MAINSITE_KEY else {}
 
 FY_ID = os.getenv("FYERS_USERNAME")
 APP_ID = os.getenv("FYERS_APP_ID")
@@ -111,15 +124,35 @@ def run_execution_manager():
         exit(1)
 
     # --- SECURE TOKEN DEPOSIT ---
+
+    token_payload = {"fyers_access_token": access_token, "updated_at": datetime.now().isoformat()}
+    
+    # 1. Primary Vault Deposit
     try:
         requests.patch(
             f"{URL}/rest/v1/broker_sessions?id=eq.1", 
             headers=HEADERS, 
-            json={"fyers_access_token": access_token, "updated_at": datetime.now().isoformat()}
+            json=token_payload,
+            timeout=5
         )
-        print("   ✅ Live token securely deposited into Supabase Vault.")
+        print("   ✅ Live token securely deposited into Primary Supabase Vault.")
     except Exception as e:
-        print(f"   ⚠️ Vault deposit failed. UI will remain static today: {e}")
+        print(f"   ⚠️ Primary Vault deposit failed: {e}")
+
+    # 2. Main Site Vault Deposit (The Broadcast)
+    if MAINSITE_URL and MAINSITE_KEY:
+        try:
+            requests.patch(
+                f"{MAINSITE_URL}/rest/v1/broker_sessions?id=eq.1", 
+                headers=MAINSITE_HEADERS, 
+                json=token_payload,
+                timeout=5
+            )
+            print("   ✅ Live token securely broadcasted to Main Site Supabase Vault.")
+        except Exception as e:
+            print(f"   ⚠️ Main Site Vault deposit failed: {e}")
+    else:
+        print("   ℹ️ Skipping Main Site Vault deposit (Credentials missing).")
     # ============================================================
 
     # 1. The Sniper Queue Fetch
